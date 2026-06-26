@@ -10,7 +10,7 @@ from datetime import datetime
 from fastapi import FastAPI, Query, Path, Response as FastAPIResponse, Request as FastAPIRequest
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from urllib.parse import urlparse, urlsplit, urlunsplit, quote
+from urllib.parse import urlparse, urlsplit, urlunsplit, quote, parse_qs
 import re
 import requests
 
@@ -23,6 +23,54 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+BASE_URL = "https://mariopartylegacy.com"
+
+def resolve_download_files(download_href: str):
+    full_url = BASE_URL + download_href if download_href.startswith('/') else download_href
+
+    try:
+        response = requests.head(full_url, allow_redirects=True)
+        content_disposition = response.headers.get('Content-Disposition')
+        if content_disposition:
+            filename = content_disposition.split('filename=')[-1].strip('"')
+            return [{"file_name": filename, "download_link": response.url}]
+        if 'text/html' not in response.headers.get('Content-Type', ''):
+            return [{"file_name": "Filename not found", "download_link": full_url}]
+    except requests.RequestException:
+        pass
+
+    try:
+        response = requests.get(full_url, allow_redirects=True)
+        content_disposition = response.headers.get('Content-Disposition')
+        if content_disposition:
+            filename = content_disposition.split('filename=')[-1].strip('"')
+            return [{"file_name": filename, "download_link": response.url}]
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        files = []
+        for row in soup.select('.contentRow'):
+            title = row.select_one('h3.contentRow-title')
+            link = row.select_one('a.button--icon--download')
+            size = row.select_one('.contentRow-minor')
+            if not title or not link or not link.get('href'):
+                continue
+            file_info = {
+                "file_name": title.get_text(strip=True),
+                "download_link": BASE_URL + link['href'],
+            }
+            if size:
+                file_info["file_size"] = size.get_text(strip=True)
+            sub_file_id = parse_qs(urlparse(link['href']).query).get('file')
+            if sub_file_id:
+                file_info["sub_file_id"] = sub_file_id[0]
+            files.append(file_info)
+        if files:
+            return files
+    except requests.RequestException:
+        pass
+
+    return [{"file_name": "Filename not found", "download_link": full_url}]
 
 def fetch_files(id: int, file_id: int = None):
     url = f"https://mariopartylegacy.com/forum/downloads/{id}/history"
@@ -60,25 +108,21 @@ def fetch_files(id: int, file_id: int = None):
 
             link = cells[4].select_one('a')
             if link and link['href']:
-                version_info["download_link"] = "https://mariopartylegacy.com" + link['href']
-                
+                version_info["download_link"] = BASE_URL + link['href']
+
                 path = urlparse(version_info["download_link"]).path
                 parts = path.split('/')
                 if len(parts) > 3:
                     version_id = parts[3].split('.')[1]
                     version_info["file_id"] = version_id
 
-                try:
-                    response_file_name = requests.head("https://mariopartylegacy.com" + link['href'], allow_redirects=True)
-                    content_disposition = response_file_name.headers.get('Content-Disposition')
-                    if content_disposition:
-                        filename = content_disposition.split('filename=')[-1].strip('\"')
-                    else:
-                        filename = "Filename not found"
-                except requests.RequestException:
-                    filename = "Filename not found"
-                
-                version_info["file_name"] = filename
+                download_files = resolve_download_files(link['href'])
+                if len(download_files) == 1:
+                    version_info["file_name"] = download_files[0]["file_name"]
+                    version_info["download_link"] = download_files[0]["download_link"]
+                else:
+                    version_info["files"] = download_files
+                    version_info["file_name"] = ", ".join(f["file_name"] for f in download_files)
 
             versions.append(version_info)
 
