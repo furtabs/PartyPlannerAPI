@@ -8,8 +8,9 @@
 from bs4 import BeautifulSoup
 from datetime import datetime
 from fastapi import FastAPI, Query, Path, Response as FastAPIResponse, Request as FastAPIRequest
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pathlib import Path as FilePath
 from urllib.parse import urlparse, urlsplit, urlunsplit, quote, parse_qs
 import re
 import requests
@@ -25,6 +26,66 @@ app.add_middleware(
 )
 
 BASE_URL = "https://mariopartylegacy.com"
+CACHE_DIR = FilePath(__file__).parent / "cache"
+IMAGE_CACHE_DIR = CACHE_DIR / "images"
+
+def _project_icon_source_url(project_id: int) -> str:
+    return f"{BASE_URL}/forum/data/resource_icons/0/{project_id}.jpg"
+
+def _project_icon_cache_path(project_id: int) -> FilePath:
+    return IMAGE_CACHE_DIR / f"{project_id}.jpg"
+
+def ensure_project_icon_cached(project_id: int):
+    cache_path = _project_icon_cache_path(project_id)
+    if cache_path.exists():
+        return cache_path
+    try:
+        response = requests.get(_project_icon_source_url(project_id), timeout=15)
+        if response.status_code != 200:
+            return None
+        IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(response.content)
+        return cache_path
+    except requests.RequestException:
+        return None
+
+def _parse_top_board_item(item):
+    board = {}
+    title_tag = item.find('div', class_='structItem-title').find('a')
+    if title_tag:
+        board['name'] = title_tag.text.strip()
+        board['link'] = 'https://www.mariopartylegacy.com' + title_tag['href']
+        match = re.search(r'\.(\d+)/', title_tag['href'])
+        if match:
+            board['id'] = int(match.group(1))
+    creator_tag = item.find('a', class_='username')
+    if creator_tag:
+        board['creator'] = creator_tag.text.strip()
+    meta = item.find_all('dl', class_='pairs pairs--justified')
+    for pair in meta:
+        dt = pair.find('dt')
+        dd = pair.find('dd')
+        if not dt or not dd:
+            continue
+        label = dt.text.strip().lower()
+        value = dd.text.strip()
+        if 'downloads' in label:
+            board['downloads'] = value
+        elif 'views' in label:
+            board['views'] = value
+        elif 'version' in label:
+            board['version'] = value
+        elif 'updated' in label:
+            board['updated'] = value
+    return board
+
+def _scrape_top_boards_page(page: int):
+    url = f"https://www.mariopartylegacy.com/forum/downloads/categories/boards.1/?page={page}"
+    response = requests.get(url)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, 'html.parser')
+    items = soup.find_all('div', class_='structItem--resource')
+    return [_parse_top_board_item(item) for item in items]
 
 def resolve_download_files(download_href: str):
     full_url = BASE_URL + download_href if download_href.startswith('/') else download_href
@@ -183,10 +244,12 @@ def search_projects(term: str, gameId: int = None):
                     
                     # Check if the extracted_gameId matches the provided gameId
                     if gameId is None or extracted_gameId == gameId:
+                        ensure_project_icon_cached(project_id)
                         project_info = {
                             "name": name,
                             "gameId": extracted_gameId,
-                            "projectId": project_id
+                            "projectId": project_id,
+                            "icon": f"/project/{project_id}/icon",
                         }
                         results.append(project_info)
 
@@ -316,53 +379,30 @@ async def search_for_projects(
         return {"error": "No results"}
 
 @app.get("/project/top")
-async def get_top_boards(max: int = Query(50, description="Maximum number of boards to return")):
+async def get_top_boards(
+    max: int = Query(50, description="Maximum number of boards to return"),
+    offset: int = Query(0, ge=0, description="Number of boards to skip before returning results"),
+):
     boards = []
     page = 1
     safety_limit = 100
-    while len(boards) < max and page <= safety_limit:
-        url = f"https://www.mariopartylegacy.com/forum/downloads/categories/boards.1/?page={page}"
-        response = requests.get(url)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        found = False
-        for item in soup.find_all('div', class_='structItem--resource'):
-            found = True
-            board = {}
-            title_tag = item.find('div', class_='structItem-title').find('a')
-            if title_tag:
-                board['name'] = title_tag.text.strip()
-                board['link'] = 'https://www.mariopartylegacy.com' + title_tag['href']
-                # Extract id from the link, e.g. /forum/downloads/board-name.123/ -> 123
-                match = re.search(r'\.(\d+)/', title_tag['href'])
-                if match:
-                    board['id'] = int(match.group(1))
-            creator_tag = item.find('a', class_='username')
-            if creator_tag:
-                board['creator'] = creator_tag.text.strip()
-            meta = item.find_all('dl', class_='pairs pairs--justified')
-            for pair in meta:
-                dt = pair.find('dt')
-                dd = pair.find('dd')
-                if not dt or not dd:
-                    continue
-                label = dt.text.strip().lower()
-                value = dd.text.strip()
-                if 'downloads' in label:
-                    board['downloads'] = value
-                elif 'views' in label:
-                    board['views'] = value
-                elif 'version' in label:
-                    board['version'] = value
-                elif 'updated' in label:
-                    board['updated'] = value
-            boards.append(board)
-            if len(boards) >= max:
-                break
-        if not found or len(boards) >= max:
+    needed = offset + max
+    while len(boards) < needed and page <= safety_limit:
+        page_boards = _scrape_top_boards_page(page)
+        if not page_boards:
+            break
+        boards.extend(page_boards)
+        if len(boards) >= needed:
             break
         page += 1
-    return boards[:max]
+    return boards[offset:offset + max]
+
+@app.get("/project/{projectId}/icon")
+async def get_project_icon(projectId: int = Path(..., description="The Project ID of the board icon to serve.")):
+    cache_path = ensure_project_icon_cached(projectId)
+    if not cache_path:
+        return FastAPIResponse("Icon not found", status_code=404)
+    return FileResponse(cache_path, media_type="image/jpeg")
 
 @app.get("/project/{projectId}")
 async def get_project_info(projectId: int = Path(..., description="The Project ID of the project to lookup.")):
